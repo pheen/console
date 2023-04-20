@@ -276,6 +276,137 @@ pub fn read_single_key() -> io::Result<Key> {
     rv
 }
 
+pub fn read_single_raw_key(fd_path: String) -> io::Result<Key> {
+    let tty_f;
+    let fd = {
+        tty_f = fs::File::open(fd_path.clone())?;
+        tty_f.as_raw_fd()
+    };
+    let mut termios = core::mem::MaybeUninit::uninit();
+    c_result(|| unsafe { libc::tcgetattr(fd, termios.as_mut_ptr()) })?;
+    let mut termios = unsafe { termios.assume_init() };
+    let original = termios;
+    unsafe { libc::cfmakeraw(&mut termios) };
+    c_result(|| unsafe { libc::tcsetattr(fd, libc::TCSADRAIN, &termios) })?;
+
+    let rv = match read_single_char(fd)? {
+        Some('\x1b') => {
+            // Escape was read, keep reading in case we find a familiar key
+            if let Some(c1) = read_single_char(fd)? {
+                // println!("{:#?}", c1);
+                // panic!("bla");
+
+                if c1 == '[' || c1 == 'O' {
+                    if let Some(c2) = read_single_char(fd)? {
+                        match c2 {
+                            'A' => Ok(Key::ArrowUp),
+                            'B' => Ok(Key::ArrowDown),
+                            'C' => Ok(Key::ArrowRight),
+                            'D' => Ok(Key::ArrowLeft),
+                            'H' => Ok(Key::Home),
+                            'F' => Ok(Key::End),
+                            'Z' => Ok(Key::BackTab),
+                            _ => {
+                                let c3 = read_single_char(fd)?;
+                                if let Some(c3) = c3 {
+                                    if c3 == '~' {
+                                        match c2 {
+                                            '1' => Ok(Key::Home), // tmux
+                                            '2' => Ok(Key::Insert),
+                                            '3' => Ok(Key::Del),
+                                            '4' => Ok(Key::End), // tmux
+                                            '5' => Ok(Key::PageUp),
+                                            '6' => Ok(Key::PageDown),
+                                            '7' => Ok(Key::Home), // xrvt
+                                            '8' => Ok(Key::End),  // xrvt
+                                            _ => Ok(Key::UnknownEscSeq(vec![c1, c2, c3])),
+                                        }
+                                    } else {
+                                        Ok(Key::UnknownEscSeq(vec![c1, c2, c3]))
+                                    }
+                                } else {
+                                    // \x1b[ and 1 more char
+                                    Ok(Key::UnknownEscSeq(vec![c1, c2]))
+                                }
+                            }
+                        }
+                    } else {
+                        // \x1b[ and no more input
+                        Ok(Key::UnknownEscSeq(vec![c1]))
+                    }
+                } else {
+                    println!("WAT {:#?}", vec![c1]);
+                    // char after escape is not [
+                    Ok(Key::UnknownEscSeq(vec![c1]))
+                }
+            } else {
+                //nothing after escape
+                Ok(Key::Escape)
+            }
+        }
+        Some(c) => {
+            let byte = c as u8;
+
+            // println!("byte: {:#?}", byte);
+
+            let mut buf: [u8; 4] = [byte, 0, 0, 0];
+
+            if byte & 224u8 == 192u8 {
+                // a two byte unicode character
+                read_bytes(fd, &mut buf[1..], 1)?;
+                Ok(key_from_utf8(&buf[..2]))
+            } else if byte & 240u8 == 224u8 {
+                // a three byte unicode character
+                read_bytes(fd, &mut buf[1..], 2)?;
+                Ok(key_from_utf8(&buf[..3]))
+            } else if byte & 248u8 == 240u8 {
+                // a four byte unicode character
+                read_bytes(fd, &mut buf[1..], 3)?;
+                Ok(key_from_utf8(&buf[..4]))
+            } else {
+                Ok(match c {
+                    '\n' | '\r' => Key::Enter,
+                    '\x7f' => Key::Backspace,
+                    '\t' => Key::Tab,
+                    '\x01' => Key::Home,      // Control-A (home)
+                    '\x05' => Key::End,       // Control-E (end)
+                    '\x08' => Key::Backspace, // Control-H (8) (Identical to '\b')
+                    _ => Key::Char(c),
+                })
+            }
+        }
+        None => {
+            // there is no subsequent byte ready to be read, block and wait for input
+
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+
+            // negative timeout means that it will block indefinitely
+            let ret = unsafe { libc::poll(&mut pollfd as *mut _, 1, -1) };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            read_single_raw_key(fd_path)
+        }
+    };
+    c_result(|| unsafe { libc::tcsetattr(fd, libc::TCSADRAIN, &original) })?;
+
+    // if the user hit ^C we want to signal SIGINT to outselves.
+    if let Err(ref err) = rv {
+        if err.kind() == io::ErrorKind::Interrupted {
+            unsafe {
+                libc::raise(libc::SIGINT);
+            }
+        }
+    }
+
+    rv
+}
+
 pub fn key_from_utf8(buf: &[u8]) -> Key {
     if let Ok(s) = str::from_utf8(buf) {
         if let Some(c) = s.chars().next() {
