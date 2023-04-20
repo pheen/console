@@ -279,6 +279,14 @@ impl Term {
         }
     }
 
+    pub fn read_raw_key(&self, fd_path: String) -> io::Result<Key> {
+        if !self.is_tty {
+            Ok(Key::Unknown)
+        } else {
+            read_single_raw_key(fd_path)
+        }
+    }
+
     /// Read one line of input.
     ///
     /// This does not include the trailing newline.  If the terminal is not
